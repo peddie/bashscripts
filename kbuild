@@ -1,0 +1,102 @@
+#!/bin/bash
+
+# I was trying to debug some virtualbox problems (always a
+# fundertaking) and ended up automating kernel builds a bit.
+#
+# This script depends on debian tools 'fakeroot', 'kernel-package',
+# 'patch' and 'build-essential'.  It takes as an argument a URL to a
+# kernel tarball or patch.  An optional second argument is the kernel
+# config on which to base this new kernel's configuration; the default
+# is to base it on the config of the currently running kernel.
+
+arch="i386";
+kdir="~/software/kernel"
+concurrent=5
+nametag=mp
+
+mkdir -p $kdir
+pushd $kdir
+
+# Download a kernel tarball and unpack.
+function dl () {
+   echo "Downloading kernel version $2:"
+   (wget -c -O - "$1" | tar -xj) || (echo "Failed to download $2." && exit 1);
+   echo "Done downloading $2."
+}
+
+# Compute the kernel to download from a tarball URL, download, unpack
+# and go into the new directory.
+function dlkernel () {
+    newkern=$(echo "$1" | perl -pe "s/.*(linux-\d\.\d+\.\d+).tar.*/\1/g");
+
+    dl $1 $newkern;
+
+    cd $newkern;
+}
+
+# Compute the kernel to download from a patch URL, download, unpack,
+# go into the new directory and apply the patch.
+function dlpatch () {
+    newkern=$(echo "$1" | perl -pe "s/.*patch(-\d\.\d+\.\d+)\.bz2.*/linux\1/g")
+
+    basekernurl=$(echo "$1" | perl -pe "s/patch(-\d\.\d+)\.\d+\.bz2/linux\1.tar.bz2/g")
+
+    basekern=$(echo "$basekernurl" | perl -pe "s/.*(linux-\d\.\d+\.?\d*?).tar.*/\1/g");
+
+    dl $1 $newkern;
+
+    mv $basekern $newkern
+    cd $newkern;
+
+    echo "Patching $basekern up to $newkern:"
+    (wget -O - "$1" | bzcat | patch -p1) || (echo "Failed to patch $basekern -> $newkern." && exit 1);
+    echo "Done patching to $newkern."
+
+    return $newkern
+}
+
+# Is this a patch url or a tarball url?
+if echo $1 | grep -q "/patch-"
+then
+    echo "This seems to be the URL to a patch."
+    dlpatch "$1";
+else
+    echo "This seems to be the URL to a tarball."
+    dlkernel "$1";
+fi
+
+# Should we use the current config or one specified on the command
+# line?
+if [ -z $2 ]
+then
+    echo "No config file specified; copying config for current kernel version `uname -r`."
+    cp /boot/config-`uname -r`* .config
+else
+    cp "$2" .config
+fi
+
+# Accept all defaults from the old config file when configuring this
+# new kernel.
+echo "Configuring kernel $newkern:"
+(yes '
+' | make oldconfig) || (echo "Failed to configure $newkern." && exit 1);
+echo "Done configuring $newkern."
+
+# Build with the debian tools, so we end up with .deb packages for the kernel and headers.
+echo "Building kernel $newkern:"
+CONCURRENCY_LEVEL=$concurrent fakeroot make-kpkg --initrd --us --uc --bzimage --revision 0 --append-to-version $nametag -j $concurrent kernel_image kernel_headers || (echo "Failed to build $newkern." && exit 1);
+echo "Done building $newkern."
+
+cd ..
+
+kversion=$(echo "$newkern" | perl -pe "s/linux-(\d\.\d+\.?\d*)/\1/g");
+
+image="linux-image-${kversion}${nametag}_0_${arch}.deb"
+headers="linux-headers-${kversion}${nametag}_0_${arch}.deb"
+
+# Install the new packages.
+echo "Installing $newkern:"
+sudo dpkg -i $image $headers || (echo "Failed to install $newkern." && exit 1);
+echo "Done installing $newkern."
+
+popd
